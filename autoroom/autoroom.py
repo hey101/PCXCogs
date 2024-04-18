@@ -86,6 +86,7 @@ class AutoRoom(
         **perms_public,
         "manage_channels": True,
         "manage_messages": True,
+        "move_members": True,
     }
     perms_bot_dest: ClassVar[dict[str, bool]] = {
         **perms_autoroom_owner,
