@@ -459,7 +459,10 @@ class AutoRoom(
                     perms.update(target, self.perms_public)
 
         # Update overwrites for default role to account for AutoRoom type
-        if member_roles or autoroom_source_config["room_type"] == "private":
+
+        # Removed member roles so it goes off room type
+        # if member_roles or autoroom_source_config["room_type"] == "private":
+        if autoroom_source_config["room_type"] == "private":
             perms.update(guild.default_role, self.perms_private)
         elif autoroom_source_config["room_type"] == "locked":
             perms.update(guild.default_role, self.perms_locked)
