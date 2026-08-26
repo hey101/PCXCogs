@@ -1,7 +1,9 @@
 """AutoRoom cog for Red-DiscordBot by PhasecoreX."""
 
+import random
 from abc import ABC
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 import discord
@@ -37,7 +39,7 @@ class AutoRoom(
     """
 
     __author__ = "PhasecoreX"
-    __version__ = "3.9.1"
+    __version__ = "4.0.7"
 
     default_global_settings: ClassVar[dict[str, int]] = {"schema_version": 0}
     default_guild_settings: ClassVar[dict[str, bool | list[int]]] = {
@@ -282,7 +284,7 @@ class AutoRoom(
             if voice_channel:
                 if isinstance(voice_channel, discord.VoiceChannel):
                     # Delete AutoRoom if it is empty
-                    await self._process_autoroom_delete(voice_channel)
+                    await self._process_autoroom_delete(voice_channel, None)
             else:
                 # AutoRoom has already been deleted, clean up legacy text channel if it still exists
                 legacy_text_channel = await self.get_autoroom_legacy_text_channel(
@@ -332,11 +334,14 @@ class AutoRoom(
         if await self.bot.cog_disabled_in_guild(self, member.guild):
             return
 
+        if leaving.channel == joining.channel:
+            return
+
         # If user left an AutoRoom, do cleanup
         if isinstance(leaving.channel, discord.VoiceChannel):
             autoroom_info = await self.get_autoroom_info(leaving.channel)
             if autoroom_info:
-                deleted = await self._process_autoroom_delete(leaving.channel)
+                deleted = await self._process_autoroom_delete(leaving.channel, member)
                 if not deleted:
                     # AutoRoom wasn't deleted, so update text channel perms
                     await self._process_autoroom_legacy_text_perms(leaving.channel)
@@ -357,7 +362,7 @@ class AutoRoom(
             if asc:
                 await self._process_autoroom_create(joining.channel, asc, member)
             # If user entered an AutoRoom, allow them into the associated text channel
-            if await self.get_autoroom_info(joining.channel):
+            elif await self.get_autoroom_info(joining.channel):
                 await self._process_autoroom_legacy_text_perms(joining.channel)
 
     @commands.Cog.listener()
@@ -376,7 +381,7 @@ class AutoRoom(
                 perms.update(member, asc["perms"]["deny"])
                 if perms.modified:
                     await autoroom_channel.edit(
-                        overwrites=perms.overwrites if perms.overwrites else {},
+                        overwrites=perms.overwrites or {},
                         reason="AutoRoom: Rejoining user, prevent deny evasion",
                     )
 
@@ -429,16 +434,14 @@ class AutoRoom(
         taken_channel_names = [
             voice_channel.name for voice_channel in dest_category.voice_channels
         ]
-        new_channel_name = self._generate_channel_name(
+        new_channel_name = await self._generate_channel_name(
             autoroom_source_config, member, taken_channel_names
         )
 
         # Generate overwrites
         perms = Perms()
         dest_perms = dest_category.permissions_for(dest_category.guild.me)
-        source_overwrites = (
-            autoroom_source.overwrites if autoroom_source.overwrites else {}
-        )
+        source_overwrites = autoroom_source.overwrites or {}
         member_roles = self.get_member_roles(autoroom_source)
         for target, permissions in source_overwrites.items():
             # We can't put manage_roles in overwrites, so just get rid of it
@@ -485,14 +488,18 @@ class AutoRoom(
             perms.update(role, autoroom_source_config["perms"]["allow"])
 
         # Create new AutoRoom
-        new_voice_channel = await guild.create_voice_channel(
-            name=new_channel_name,
-            category=dest_category,
-            reason="AutoRoom: New AutoRoom needed.",
-            overwrites=perms.overwrites if perms.overwrites else {},
-            bitrate=min(autoroom_source.bitrate, int(guild.bitrate_limit)),
-            user_limit=autoroom_source.user_limit,
-        )
+        voice_channel_config = {
+            "name": new_channel_name,
+            "category": dest_category,
+            "reason": "AutoRoom: New AutoRoom needed.",
+            "bitrate": min(autoroom_source.bitrate, int(guild.bitrate_limit)),
+            "user_limit": autoroom_source.user_limit,
+        }
+        if perms.overwrites:
+            voice_channel_config["overwrites"] = perms.overwrites
+        if autoroom_source.rtc_region:
+            voice_channel_config["rtc_region"] = autoroom_source.rtc_region
+        new_voice_channel = await guild.create_voice_channel(**voice_channel_config)
         await self.config.channel(new_voice_channel).source_channel.set(
             autoroom_source.id
         )
@@ -503,7 +510,7 @@ class AutoRoom(
                 new_voice_channel, reason="AutoRoom: Move user to new AutoRoom."
             )
         except discord.HTTPException:
-            await self._process_autoroom_delete(new_voice_channel)
+            await self._process_autoroom_delete(new_voice_channel, member)
             return
 
         # Create optional legacy text channel
@@ -533,7 +540,7 @@ class AutoRoom(
                 # Add all the mod/admin roles, if required
                 perms.update(role, self.perms_legacy_text_allow)
             # Create text channel
-            text_channel_topic = self.template.render(
+            text_channel_topic = await self.template.render(
                 autoroom_source_config["text_channel_topic"],
                 self.get_template_data(member),
             )
@@ -542,7 +549,7 @@ class AutoRoom(
                 category=dest_category,
                 topic=text_channel_topic,
                 reason="AutoRoom: New legacy text channel needed.",
-                overwrites=perms.overwrites if perms.overwrites else {},
+                overwrites=perms.overwrites or {},
             )
 
             await self.config.channel(new_voice_channel).associated_text_channel.set(
@@ -551,8 +558,8 @@ class AutoRoom(
 
         # Send text chat hint if enabled
         if autoroom_source_config["text_channel_hint"]:
-            with suppress(RuntimeError):
-                hint = self.template.render(
+            with suppress(Exception):
+                hint = await self.template.render(
                     autoroom_source_config["text_channel_hint"],
                     self.get_template_data(member),
                 )
@@ -560,15 +567,21 @@ class AutoRoom(
                     if new_legacy_text_channel:
                         await new_legacy_text_channel.send(hint)
                     else:
-                        await new_voice_channel.send(hint)
+                        await new_voice_channel.send(hint[:2000].strip())
 
     @staticmethod
-    async def _process_autoroom_delete(voice_channel: discord.VoiceChannel) -> bool:
+    async def _process_autoroom_delete(
+        voice_channel: discord.VoiceChannel, leaving_user: discord.Member | None
+    ) -> bool:
         """Delete AutoRoom if empty."""
         if (
+            # If there are no members left in the channel, or if there's just one and it's the person currently leaving (race condition)
             not voice_channel.members
-            and voice_channel.permissions_for(voice_channel.guild.me).manage_channels
-        ):
+            or (
+                len(voice_channel.members) == 1
+                and voice_channel.members[0] == leaving_user
+            )
+        ) and voice_channel.permissions_for(voice_channel.guild.me).manage_channels:
             with suppress(
                 discord.NotFound
             ):  # Sometimes this happens when the user manually deletes their channel
@@ -600,11 +613,11 @@ class AutoRoom(
         # Edit channel if overwrites were modified
         if perms.modified:
             await legacy_text_channel.edit(
-                overwrites=perms.overwrites if perms.overwrites else {},
+                overwrites=perms.overwrites or {},
                 reason="AutoRoom: Legacy text channel permission update",
             )
 
-    def _generate_channel_name(
+    async def _generate_channel_name(
         self,
         autoroom_source_config: dict,
         member: discord.Member,
@@ -621,15 +634,22 @@ class AutoRoom(
         template = template or channel_name_template["username"]
 
         data = self.get_template_data(member)
+        data["random_seed"] = (
+            f"{member.id}{random.random()}"  # noqa: S311 # Doesn't need to be secure
+        )
         new_channel_name = None
         attempt = 1
-        with suppress(RuntimeError):
-            new_channel_name = self.format_template_room_name(template, data, attempt)
+        with suppress(Exception):
+            new_channel_name = await self.format_template_room_name(
+                template, data, attempt
+            )
 
         if not new_channel_name:
             # Either the user screwed with the template, or the template returned nothing. Use a default one instead.
             template = channel_name_template["username"]
-            new_channel_name = self.format_template_room_name(template, data, attempt)
+            new_channel_name = await self.format_template_room_name(
+                template, data, attempt
+            )
 
         # Check for duplicate names
         attempted_channel_names = []
@@ -639,7 +659,9 @@ class AutoRoom(
         ):
             attempt += 1
             attempted_channel_names.append(new_channel_name)
-            new_channel_name = self.format_template_room_name(template, data, attempt)
+            new_channel_name = await self.format_template_room_name(
+                template, data, attempt
+            )
         return new_channel_name
 
     #
@@ -647,23 +669,37 @@ class AutoRoom(
     #
 
     @staticmethod
-    def get_template_data(member: discord.Member | discord.User) -> dict[str, str]:
+    def get_template_data(member: discord.Member | discord.User) -> dict[str, Any]:
         """Return a dict of template data based on a member."""
-        data = {"username": member.display_name, "mention": member.mention}
+        data = {
+            "username": member.display_name,
+            "mention": member.mention,
+            "datetime": datetime.now(tz=UTC),
+            "member": {
+                "display_name": member.display_name,
+                "mention": member.mention,
+                "name": member.name,
+                "id": member.id,
+                "global_name": member.global_name,
+                "bot": member.bot,
+                "system": member.system,
+            },
+            "game": None,
+        }
         if isinstance(member, discord.Member):
             for activity in member.activities:
-                if activity.type == discord.ActivityType.playing:
-                    data["game"] = activity.name or ""
+                if activity.type == discord.ActivityType.playing and activity.name:
+                    data["game"] = activity.name
                     break
         return data
 
-    def format_template_room_name(self, template: str, data: dict, num: int = 1) -> str:
+    async def format_template_room_name(
+        self, template: str, data: dict, num: int = 1
+    ) -> str:
         """Return a formatted channel name, taking into account the 100 character channel name limit."""
         nums = {"dupenum": num}
-        return self.template.render(
-            template=template,
-            data={**nums, **data},
-        )[:100].strip()
+        msg = await self.template.render(template, {**data, **nums})
+        return msg[:100].strip()
 
     async def is_admin_or_admin_role(self, who: discord.Role | discord.Member) -> bool:
         """Check if a member (or role) is an admin (role).
@@ -782,9 +818,7 @@ class AutoRoom(
     ) -> tuple[bool, SettingDisplay | None]:
         result = True
         checked_perms = {}
-        source_overwrites = (
-            autoroom_source.overwrites if autoroom_source.overwrites else {}
-        )
+        source_overwrites = autoroom_source.overwrites or {}
         for permissions in source_overwrites.values():
             # We can't put manage_roles in overwrites, so just get rid of it
             # Also get rid of view_channel, connect, and send_messages, as we will be controlling those
